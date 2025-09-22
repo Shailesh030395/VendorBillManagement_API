@@ -5,26 +5,49 @@ on:
     branches:
       - main
 
+
 jobs:
   build:
     name: Build and analyze
     runs-on: windows-latest
-    
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of analysis
+          fetch-depth: 0  # keep history for better analysis relevance
+
+      - name: Set up .NET SDKs (6/7/8)
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            7.0.x
+            6.0.x
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           java-version: 17
-          distribution: 'zulu' # Alternative distribution options are available.
+          distribution: 'zulu'
+
+      - name: Cache NuGet
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.nuget/packages
+            ~/.local/share/NuGet/Cache
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/packages.lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
       - name: Cache SonarQube packages
         uses: actions/cache@v4
         with:
           path: ~\.sonar\cache
           key: ${{ runner.os }}-sonar
           restore-keys: ${{ runner.os }}-sonar
+
       - name: Cache SonarQube scanner
         id: cache-sonar-scanner
         uses: actions/cache@v4
@@ -32,15 +55,46 @@ jobs:
           path: .\.sonar\scanner
           key: ${{ runner.os }}-sonar-scanner
           restore-keys: ${{ runner.os }}-sonar-scanner
+
       - name: Install SonarQube scanner
         if: steps.cache-sonar-scanner.outputs.cache-hit != 'true'
-        shell: powershell
+        shell: pwsh
         run: |
-          New-Item -Path .\.sonar\scanner -ItemType Directory
+          New-Item -Path .\.sonar\scanner -ItemType Directory -Force | Out-Null
           dotnet tool update dotnet-sonarscanner --tool-path .\.sonar\scanner
-      - name: Build and analyze
-        shell: powershell
+
+      - name: Build and analyze with SonarQube
+        shell: pwsh
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
         run: |
-          .\.sonar\scanner\dotnet-sonarscanner begin /k:"VendorBillManagement_API" /d:sonar.token="${{ secrets.SONAR_TOKEN }}" /d:sonar.host.url="${{ secrets.SONAR_HOST_URL }}"
-          dotnet build
-          .\.sonar\scanner\dotnet-sonarscanner end /d:sonar.token="${{ secrets.SONAR_TOKEN }}"
+          $ErrorActionPreference = 'Stop'
+
+          # repo root and solution discovery
+          $repoRoot = $Env:GITHUB_WORKSPACE
+          $sln = Get-ChildItem -Path $repoRoot -Recurse -Filter *.sln | Select-Object -First 1
+          if (-not $sln) { throw "No .sln file found in the repository." }
+          $slnDir = Split-Path $sln.FullName
+          Write-Host "Using solution: $($sln.FullName)"
+
+          # dotnet-sonarscanner absolute path (works no matter current dir)
+          $scanner = Join-Path $repoRoot '.sonar\scanner\dotnet-sonarscanner'
+          if (Test-Path "$scanner.exe") { $scanner = "$scanner.exe" }
+
+          # move into solution directory for begin -> build -> end
+          Set-Location $slnDir
+
+          # BEGIN
+          & $scanner begin `
+           
+            /d:sonar.token="$Env:SONAR_TOKEN" `
+            /d:sonar.host.url="$Env:SONAR_HOST_URL" `
+            /d:sonar.scanner.skipJreProvisioning=true
+
+          # RESTORE & BUILD (Release; no incremental)
+          dotnet restore $sln.Name
+          dotnet build $sln.Name --configuration Release --no-incremental -v:m
+
+          # END
+          & $scanner end /d:sonar.token="$Env:SONAR_TOKEN"
